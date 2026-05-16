@@ -60,15 +60,15 @@ class CompanyDetail:
 
     def to_dict(self) -> dict:
         return {
-            "ten_doanh_nghiep": self.name,
-            "ten_tieng_nuoc_ngoai": self.name_foreign or "",
-            "ten_viet_tat": self.short_name or "",
-            "tinh_trang_hoat_dong": self.status or "",
-            "ma_so_doanh_nghiep": self.tax_code,
-            "loai_hinh_phap_ly": self.legal_form or "",
-            "ngay_bat_dau_thanh_lap": self.establishment_date or "",
-            "nguoi_dai_dien_phap_luat": self.legal_representative or "",
-            "dia_chi_tru_so_chinh": self.address or "",
+            "company_name": self.name,
+            "foreign_name": self.name_foreign or "",
+            "short_name": self.short_name or "",
+            "status": self.status or "",
+            "tax_code": self.tax_code,
+            "legal_form": self.legal_form or "",
+            "establishment_date": self.establishment_date or "",
+            "legal_representative": self.legal_representative or "",
+            "address": self.address or "",
         }
 
     def __str__(self) -> str:

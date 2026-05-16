@@ -174,6 +174,11 @@ class DKKDCrawler:
         return _parse_detail_html(BeautifulSoup(html, "lxml"))
 
     def _get_detail_fields_via_cloakbrowser(self, taxcode: str, company_id: str = "") -> dict:
+        """
+        Navigate to the captcha page using the requests session (which handles the
+        ASP.NET form POST correctly), then hand the URL + session cookies to CloakBrowser
+        so it can render the reCAPTCHA, solve the audio challenge, and read the result.
+        """
         try:
             from cloakbrowser import launch
         except ImportError:
@@ -184,47 +189,38 @@ class DKKDCrawler:
             )
             return {}
 
+        # Step 1 — use the requests session to navigate to the captcha page and get its URL
+        captcha_url = self._get_captcha_page_url(taxcode, company_id)
+        if not captcha_url:
+            print("[crawler] could not reach captcha page via requests", file=sys.stderr)
+            return {}
+
+        # Step 2 — extract session cookies to share with the browser
+        session_cookies = [
+            {
+                "name": c.name,
+                "value": c.value,
+                "domain": c.domain or "dichvuthongtin.dkkd.gov.vn",
+                "path": c.path or "/",
+            }
+            for c in self._session.cookies
+        ]
+
         result: dict = {}
-        # headless=False is required: Google's reCAPTCHA audio challenge is disabled in
-        # headless mode even with fingerprint spoofing, but works in headed mode.
+        # headless=False: Google's reCAPTCHA audio challenge is disabled in headless mode
         browser = launch(headless=False, humanize=True, locale="vi-VN")
         ctx = browser.new_context(
             extra_http_headers={"Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8"},
+            ignore_https_errors=True,
         )
+        if session_cookies:
+            ctx.add_cookies(session_cookies)
+
         page = ctx.new_page()
-
         try:
-            page.goto(SEARCH_PAGE, wait_until="networkidle", timeout=30_000)
+            # Navigate directly to the captcha page (no form submission in browser)
+            page.goto(captcha_url, wait_until="networkidle", timeout=30_000)
 
-            # Fill search field
-            page.locator("input#ctl00_FldSearch").fill(taxcode)
-
-            if company_id:
-                # Set company ID directly via JS — avoids needing to click autocomplete
-                page.evaluate(
-                    f"document.getElementById('ctl00_FldSearchID').value = '{company_id}'"
-                )
-            else:
-                # Wait for jQuery-UI autocomplete dropdown and click the first suggestion
-                page.wait_for_timeout(1500)
-                first_item = page.locator(".ui-autocomplete .ui-menu-item a").first
-                if first_item.is_visible(timeout=4_000):
-                    first_item.click()
-                    # Autocomplete's select handler already clicks the search button,
-                    # so we land directly on the captcha page.
-                    page.wait_for_load_state("networkidle", timeout=25_000)
-                    if page.locator("input#ctl00_C_btnSubmit").is_visible(timeout=3_000):
-                        _solve_captcha_and_submit(page)
-                        page.wait_for_load_state("networkidle", timeout=30_000)
-                    html = page.content()
-                    result = _parse_detail_html(BeautifulSoup(html, "lxml"))
-                    return result
-
-            # Click the search button to navigate to the captcha page
-            page.locator("input#ctl00_btnSearch").click()
-            page.wait_for_load_state("networkidle", timeout=25_000)
-
-            # Handle captcha and submit
             if page.locator("input#ctl00_C_btnSubmit").is_visible(timeout=5_000):
                 _solve_captcha_and_submit(page)
                 page.wait_for_load_state("networkidle", timeout=30_000)
@@ -238,6 +234,50 @@ class DKKDCrawler:
             browser.close()
 
         return result
+
+    def _get_captcha_page_url(self, taxcode: str, company_id: str) -> Optional[str]:
+        """POST the search form via requests and return the captcha page URL."""
+        if not company_id:
+            return None
+        try:
+            resp0 = self._session.get(SEARCH_PAGE, verify=False, timeout=30)
+            resp0.raise_for_status()
+            soup0 = BeautifulSoup(resp0.content.decode("utf-8", errors="replace"), "lxml")
+
+            def _val(name: str) -> str:
+                el = soup0.find("input", {"name": name})
+                return el["value"] if el and el.get("value") else ""
+
+            form_data = {
+                "__EVENTTARGET": "",
+                "__EVENTARGUMENT": "",
+                "__VIEWSTATE": _val("__VIEWSTATE"),
+                "__EVENTVALIDATION": _val("__EVENTVALIDATION"),
+                "ctl00$nonceKeyFld": _val("ctl00$nonceKeyFld"),
+                "ctl00$hdParameter": _val("ctl00$hdParameter"),
+                "ctl00$searchtype": "1",
+                "ctl00$FldSearch": taxcode,
+                "ctl00$FldSearchID": str(company_id),
+                "ctl00$btnSearch": "Tìm kiếm >>",
+            }
+            resp = self._session.post(
+                SEARCH_PAGE,
+                data=form_data,
+                verify=False,
+                timeout=30,
+                allow_redirects=True,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Referer": SEARCH_PAGE,
+                },
+            )
+            resp.raise_for_status()
+            # The final URL should be EnterpriseInfo.aspx?h=XXXX (the captcha page)
+            if "EnterpriseInfo.aspx" in resp.url:
+                return resp.url
+        except Exception as exc:
+            print(f"[crawler] captcha page navigation failed: {exc}", file=sys.stderr)
+        return None
 
     def scrape_by_taxcode(self, taxcode: str) -> Optional[CompanyDetail]:
         payload = json.dumps({"searchField": taxcode, "h": self._token()})
@@ -311,81 +351,169 @@ def _solve_captcha_and_submit(page) -> None:
         print(f"[captcha] submit click failed: {exc}", file=sys.stderr)
 
 
-def _configure_ffmpeg(AudioSegment) -> None:
-    """Point pydub at ffmpeg when winget installed it but the shell PATH is stale."""
-    import os, shutil, glob
-    if shutil.which("ffmpeg"):
-        return
-    # Common winget install location on Windows
-    pattern = os.path.expandvars(
-        r"%LOCALAPPDATA%\Microsoft\WinGet\Packages\Gyan.FFmpeg*\ffmpeg-*\bin\ffmpeg.exe"
-    )
-    candidates = glob.glob(pattern)
-    if candidates:
-        ffmpeg_exe = candidates[0]
-        AudioSegment.converter = ffmpeg_exe
-        AudioSegment.ffmpeg = ffmpeg_exe
-        AudioSegment.ffprobe = ffmpeg_exe.replace("ffmpeg.exe", "ffprobe.exe")
+_TRANSCRIBE_SERVERS = [
+    "https://engageub.pythonanywhere.com",
+    "https://engageub1.pythonanywhere.com",
+]
+
+
+def _transcribe_via_server(audio_url: str, lang: str = "vi-VN") -> Optional[str]:
+    """
+    Send the reCAPTCHA audio URL to a free transcription server.
+    The server downloads the MP3 and returns the spoken text — no local ffmpeg needed.
+    Returns None if all servers fail or return an invalid response.
+    """
+    audio_url = audio_url.replace("recaptcha.net", "google.com")
+    for server in _TRANSCRIBE_SERVERS:
+        try:
+            resp = requests.post(
+                server,
+                data={"input": audio_url, "lang": lang},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=60,
+            )
+            text = resp.text.strip()
+            # Server returns "0" or HTML on failure, valid text otherwise
+            if text and text != "0" and "<" not in text and len(text) <= 50:
+                return text
+        except Exception as exc:
+            print(f"[captcha] server {server} failed: {exc}", file=sys.stderr)
+    return None
 
 
 def _solve_audio_challenge(page, challenge_frame) -> None:
-    """Download the reCAPTCHA audio challenge and transcribe it using Google Speech API (free)."""
+    """
+    Switch the reCAPTCHA to audio mode and solve it.
+
+    Audio URL is read from #audio-source[src] (the <source> element inside the
+    audio player — NOT the download link).  The URL is sent to a free transcription
+    server which returns the spoken digits; we fill them in and click Verify.
+    Falls back to local Google Speech Recognition if the remote server is unavailable.
+    """
+    _DOSCAPTCHA = ".rc-doscaptcha-body"
+    MAX_ATTEMPTS = 5
+
+    try:
+        challenge_frame.locator("#recaptcha-audio-button").click()
+        page.wait_for_timeout(2_000)
+    except Exception as exc:
+        print(f"[captcha] audio button click failed: {exc}", file=sys.stderr)
+        return
+
+    seen_url: str = ""
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        # Stop if Google detected automation
+        try:
+            dos = challenge_frame.locator(_DOSCAPTCHA)
+            if dos.is_visible(timeout=500):
+                print("[captcha] automated-queries block detected, stopping", file=sys.stderr)
+                return
+        except Exception:
+            pass
+
+        # Get audio URL from the <source> element (correct selector)
+        try:
+            audio_url = challenge_frame.locator("#audio-source").get_attribute("src", timeout=6_000)
+        except Exception:
+            audio_url = None
+
+        if not audio_url:
+            print(f"[captcha] attempt {attempt}: audio source not found yet", file=sys.stderr)
+            page.wait_for_timeout(2_000)
+            continue
+
+        # Reload if same URL repeated (means previous answer was wrong)
+        if audio_url == seen_url:
+            try:
+                challenge_frame.locator("#recaptcha-reload-button").click()
+                page.wait_for_timeout(2_000)
+            except Exception:
+                pass
+            continue
+
+        seen_url = audio_url
+        print(f"[captcha] attempt {attempt}: transcribing...", file=sys.stderr)
+
+        # Determine page language for the transcription server
+        try:
+            lang = page.evaluate("document.documentElement.lang") or "vi-VN"
+        except Exception:
+            lang = "vi-VN"
+
+        # Primary: remote transcription server (no local deps needed)
+        transcription = _transcribe_via_server(audio_url, lang)
+
+        # Fallback: local Google Speech Recognition
+        if not transcription:
+            transcription = _transcribe_local(audio_url)
+
+        if not transcription:
+            print(f"[captcha] attempt {attempt}: transcription failed, reloading", file=sys.stderr)
+            try:
+                challenge_frame.locator("#recaptcha-reload-button").click()
+                page.wait_for_timeout(2_000)
+            except Exception:
+                pass
+            continue
+
+        print(f"[captcha] attempt {attempt}: got {transcription!r}", file=sys.stderr)
+        challenge_frame.locator("#audio-response").fill(transcription)
+        page.wait_for_timeout(500)
+        challenge_frame.locator("#recaptcha-verify-button").click()
+        page.wait_for_timeout(2_500)
+
+        # Check if captcha is now solved
+        gr_len = page.evaluate(
+            "document.querySelector('[name=g-recaptcha-response]')"
+            "? document.querySelector('[name=g-recaptcha-response]').value.length : 0"
+        )
+        if gr_len > 0:
+            print("[captcha] audio challenge solved", file=sys.stderr)
+            return
+
+    print("[captcha] max attempts reached", file=sys.stderr)
+
+
+def _transcribe_local(audio_url: str) -> Optional[str]:
+    """Fallback: download MP3, convert to WAV with pydub, transcribe with SpeechRecognition."""
     import io
+    import os
     import tempfile
 
     try:
         import speech_recognition as sr
         from pydub import AudioSegment
     except ImportError:
-        print("[captcha] SpeechRecognition/pydub not installed. Run: uv add SpeechRecognition pydub", file=sys.stderr)
-        return
+        return None
 
-    _configure_ffmpeg(AudioSegment)
+    # Locate ffmpeg installed by winget if not on PATH
+    import glob
+    import shutil
+    if not shutil.which("ffmpeg"):
+        pattern = os.path.expandvars(
+            r"%LOCALAPPDATA%\Microsoft\WinGet\Packages\Gyan.FFmpeg*\ffmpeg-*\bin\ffmpeg.exe"
+        )
+        candidates = glob.glob(pattern)
+        if candidates:
+            AudioSegment.converter = candidates[0]
+            AudioSegment.ffmpeg = candidates[0]
 
     try:
-        challenge_frame.locator("#recaptcha-audio-button").click()
-        page.wait_for_timeout(2_000)
-
-        # Get the audio download URL
-        audio_url = challenge_frame.locator(".rc-audiochallenge-download-link").get_attribute("href", timeout=8_000)
-        if not audio_url:
-            print("[captcha] could not find audio URL", file=sys.stderr)
-            return
-
-        print(f"[captcha] downloading audio challenge...", file=sys.stderr)
         audio_bytes = requests.get(audio_url, verify=False, timeout=20).content
-
-        # Convert MP3 → WAV in memory (pydub needs ffmpeg for MP3 decoding)
-        mp3_buf = io.BytesIO(audio_bytes)
-        segment = AudioSegment.from_mp3(mp3_buf)
-
+        segment = AudioSegment.from_mp3(io.BytesIO(audio_bytes))
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             wav_path = tmp.name
         segment.export(wav_path, format="wav")
 
-        # Transcribe with Google Speech Recognition (free, no key)
         recognizer = sr.Recognizer()
         with sr.AudioFile(wav_path) as source:
             audio_data = recognizer.record(source)
+        os.unlink(wav_path)
 
-        try:
-            import os
-            os.unlink(wav_path)
-        except Exception:
-            pass
-
-        transcription = recognizer.recognize_google(audio_data)
-        print(f"[captcha] transcription: {transcription!r}", file=sys.stderr)
-
-        # Fill response and verify
-        challenge_frame.locator("#audio-response").fill(transcription)
-        page.wait_for_timeout(500)
-        challenge_frame.locator("#recaptcha-verify-button").click()
-        page.wait_for_timeout(2_500)
-        print("[captcha] audio challenge submitted", file=sys.stderr)
-
+        return recognizer.recognize_google(audio_data)
     except Exception as exc:
-        print(f"[captcha] audio challenge failed: {exc}", file=sys.stderr)
+        print(f"[captcha] local transcription failed: {exc}", file=sys.stderr)
+        return None
 
 
 def _parse_company(raw: dict) -> Company:
