@@ -7,7 +7,8 @@ for an exact tax code match.
 The site uses an hdParameter session token on the search API and a
 LoadMore page method for paginated business lines. The detail page
 (which holds establishment date and legal form) is protected by reCAPTCHA
-and requires a headless browser via Playwright.
+and requires a headless browser via CloakBrowser (stealth Chromium that
+bypasses reCAPTCHA and bot detection at the C++ level).
 
 Usage:
     python crawler.py <taxcode_or_name>              # search only
@@ -265,8 +266,8 @@ class DKKDCrawler:
         Retrieve extra company fields (legal_form, establishment_date) from the detail page.
 
         Tries a plain HTTP request first; if reCAPTCHA is detected falls back to
-        Playwright (headless browser). Returns an empty dict when neither strategy
-        can retrieve the data.
+        CloakBrowser (stealth headless Chromium). Returns an empty dict when neither
+        strategy can retrieve the data.
 
         Args:
             taxcode: Tax code used to search and navigate to the company page
@@ -278,7 +279,7 @@ class DKKDCrawler:
         if result is not None:
             return result
 
-        return self._get_detail_fields_via_playwright(taxcode)
+        return self._get_detail_fields_via_cloakbrowser(taxcode)
 
     def _get_detail_fields_via_requests(self, taxcode: str) -> Optional[dict]:
         """
@@ -305,72 +306,68 @@ class DKKDCrawler:
 
         return _parse_detail_html(BeautifulSoup(html, "lxml"))
 
-    def _get_detail_fields_via_playwright(self, taxcode: str) -> dict:
+    def _get_detail_fields_via_cloakbrowser(self, taxcode: str) -> dict:
         """
-        Use a headless Chromium browser (Playwright) to navigate the site,
-        bypass reCAPTCHA, and extract legal_form / establishment_date.
+        Use CloakBrowser (stealth Chromium with built-in anti-fingerprinting)
+        to bypass reCAPTCHA and extract legal_form / establishment_date.
 
-        Requires:  pip install playwright && playwright install chromium
+        Requires:  pip install cloakbrowser
         """
         try:
-            from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+            from cloakbrowser import launch
         except ImportError:
             print(
-                "[crawler] playwright not installed — install with:\n"
-                "  pip install playwright && playwright install chromium\n"
+                "[crawler] cloakbrowser not installed — install with:\n"
+                "  pip install cloakbrowser\n"
                 "  Skipping legal_form and establishment_date.",
                 file=sys.stderr,
             )
             return {}
 
         result: dict = {}
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            ctx = browser.new_context(
-                user_agent=_USER_AGENT,
-                locale="vi-VN",
-                extra_http_headers={"Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8"},
-            )
-            page = ctx.new_page()
+        browser = launch(
+            headless=True,
+            humanize=True,
+            locale="vi-VN",
+        )
+        page = browser.new_page()
 
-            try:
-                # Step 1 — load the search page to establish a valid session
-                page.goto(SEARCH_PAGE, wait_until="networkidle", timeout=30_000)
+        try:
+            # Step 1 — load the search page to establish a valid session
+            page.goto(SEARCH_PAGE, wait_until="networkidle", timeout=30_000)
 
-                # Step 2 — fill in the search box and submit
-                search_input = page.locator(
-                    "input[name='ctl00$FldSearch'], input#ctl00_FldSearch, input[type='text']"
-                ).first
-                search_input.fill(taxcode)
+            # Step 2 — fill in the search box and submit
+            search_input = page.locator(
+                "input[name='ctl00$FldSearch'], input#ctl00_FldSearch, input[type='text']"
+            ).first
+            search_input.fill(taxcode)
 
-                # Click the search button (common Vietnamese labels)
-                search_btn = page.locator(
-                    "input[type='submit'], button[type='submit'], "
-                    "input[value='Tìm kiếm'], button:has-text('Tìm kiếm'), "
-                    "a:has-text('Tìm kiếm')"
-                ).first
-                search_btn.click()
-                page.wait_for_load_state("networkidle", timeout=20_000)
+            # Click the search button (common Vietnamese labels)
+            search_btn = page.locator(
+                "input[type='submit'], button[type='submit'], "
+                "input[value='Tìm kiếm'], button:has-text('Tìm kiếm'), "
+                "a:has-text('Tìm kiếm')"
+            ).first
+            search_btn.click()
+            page.wait_for_load_state("networkidle", timeout=20_000)
 
-                # Step 3 — click the matching company link in results
-                company_link = page.locator(
-                    f"a:has-text('{taxcode}'), "
-                    "table.result-table td a, "
-                    ".search-result a, "
-                    "a[href*='EnterpriseInfo']"
-                ).first
-                company_link.click()
-                page.wait_for_load_state("networkidle", timeout=20_000)
+            # Step 3 — click the matching company link in results
+            company_link = page.locator(
+                f"a:has-text('{taxcode}'), "
+                "table.result-table td a, "
+                ".search-result a, "
+                "a[href*='EnterpriseInfo']"
+            ).first
+            company_link.click()
+            page.wait_for_load_state("networkidle", timeout=20_000)
 
-                html = page.content()
-                result = _parse_detail_html(BeautifulSoup(html, "lxml"))
+            html = page.content()
+            result = _parse_detail_html(BeautifulSoup(html, "lxml"))
 
-            except PWTimeout:
-                print("[crawler] Playwright timed out loading detail page.", file=sys.stderr)
-            except Exception as exc:  # noqa: BLE001
-                print(f"[crawler] Playwright error: {exc}", file=sys.stderr)
-            finally:
-                browser.close()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[crawler] CloakBrowser error: {exc}", file=sys.stderr)
+        finally:
+            browser.close()
 
         return result
 
