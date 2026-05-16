@@ -1,14 +1,11 @@
 """Tests for the DKKD crawler."""
 import json
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from bs4 import BeautifulSoup
 
-from crawler import (
-    BusinessLine,
-    Company,
-    CompanyDetail,
+from dkkd_crawler.crawler import (
     DKKDCrawler,
     _parse_company,
     _parse_company_detail,
@@ -16,6 +13,7 @@ from crawler import (
     scrape_by_taxcode,
     search,
 )
+from dkkd_crawler.models import BusinessLine, Company, CompanyDetail
 
 
 FAKE_HD_PARAM = "639139000000000000-ABCDEF1234567890ABCDEF1234567890ABCDEF12"
@@ -215,7 +213,6 @@ class TestParseCompanyDetail:
         }
         extra = {"legal_form": "From Detail Page", "establishment_date": "31/12/2020"}
         detail = _parse_company_detail(raw, [], extra)
-        # extra (detail page) takes priority over API response fields
         assert detail.legal_form == "From Detail Page"
         assert detail.establishment_date == "31/12/2020"
 
@@ -437,7 +434,7 @@ class TestFindExactByTaxcode:
 class TestGetBusinessLines:
     def _make_load_more_mock(self, pages: list[str]) -> MagicMock:
         responses = [_make_response({"d": p}) for p in pages]
-        responses.append(_make_response({"d": ""}))  # terminal empty page
+        responses.append(_make_response({"d": ""}))
         mock = MagicMock()
         mock.post.side_effect = responses
         return mock
@@ -561,9 +558,7 @@ class TestScrapeByTaxcode:
         assert len(detail.business_lines) == 3
 
     def test_includes_detail_page_fields(self):
-        crawler = self._make_crawler_for_scrape(
-            FAKE_API_RESPONSE, []
-        )
+        crawler = self._make_crawler_for_scrape(FAKE_API_RESPONSE, [])
         detail = crawler.scrape_by_taxcode("0105987432")
         assert detail is not None
         assert detail.legal_form == "Công ty cổ phần"
@@ -594,7 +589,7 @@ class TestScrapeByTaxcode:
 
 class TestModuleLevelHelpers:
     def test_search_module_function(self):
-        with patch("crawler.DKKDCrawler") as MockCrawler:
+        with patch("dkkd_crawler.crawler.DKKDCrawler") as MockCrawler:
             instance = MockCrawler.return_value
             instance.search.return_value = [
                 Company(id="1", name="X", enterprise_code="0001", tax_code="0002")
@@ -604,7 +599,7 @@ class TestModuleLevelHelpers:
         instance.search.assert_called_once_with("query")
 
     def test_scrape_by_taxcode_module_function(self):
-        with patch("crawler.DKKDCrawler") as MockCrawler:
+        with patch("dkkd_crawler.crawler.DKKDCrawler") as MockCrawler:
             instance = MockCrawler.return_value
             expected = CompanyDetail(
                 id="1", name="X", enterprise_code="0001", tax_code="0002"
