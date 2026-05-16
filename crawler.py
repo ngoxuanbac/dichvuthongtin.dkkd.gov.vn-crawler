@@ -1,26 +1,10 @@
 """
-Crawler for dichvuthongtin.dkkd.gov.vn
-Searches for Vietnamese company information by tax code or company name,
-and scrapes full details (business lines, legal form, establishment date)
-for an exact tax code match.
+Core crawler module for dichvuthongtin.dkkd.gov.vn.
 
-The site uses an hdParameter session token on the search API and a
-LoadMore page method for paginated business lines. The detail page
-(which holds establishment date and legal form) is protected by reCAPTCHA
-and requires a headless browser via Playwright.
-
-Usage:
-    python crawler.py <taxcode_or_name>              # search only
-    python crawler.py --detail <taxcode>              # full detail (text)
-    python crawler.py --detail --json <taxcode>       # full detail (JSON)
-
-Examples:
-    python crawler.py 0105987432
-    python crawler.py "SOFTDREAMS"
-    python crawler.py --detail 0105987432
-    python crawler.py --detail --json 0105987432
+Provides DKKDCrawler for scraping Vietnamese business registration data
+by tax code (mã số thuế). The detail page is protected by reCAPTCHA;
+CloakBrowser is used as the stealth fallback.
 """
-import sys
 import json
 import warnings
 from dataclasses import dataclass, field
@@ -94,7 +78,7 @@ class BusinessLine:
 
 @dataclass
 class CompanyDetail:
-    """Full company details combining search data, detail page, and paginated business lines."""
+    """Full company details combining search data, detail page, and business lines."""
     id: str
     name: str
     enterprise_code: str
@@ -113,7 +97,6 @@ class CompanyDetail:
     business_lines: list[BusinessLine] = field(default_factory=list)
 
     def to_dict(self) -> dict:
-        """Return a dict using Vietnamese field names matching the expected output format."""
         return {
             "ten_doanh_nghiep": self.name,
             "ten_tieng_nuoc_ngoai": self.name_foreign or "",
@@ -183,17 +166,8 @@ class DKKDCrawler:
         return self._h  # type: ignore[return-value]
 
     def search(self, query: str) -> list[Company]:
-        """
-        Search for companies by tax code (mã số thuế) or company name.
-
-        Args:
-            query: Tax code or company name fragment
-
-        Returns:
-            List of matching Company objects
-        """
+        """Search for companies by tax code or company name."""
         payload = json.dumps({"searchField": query, "h": self._token()})
-
         resp = self._session.post(
             SEARCH_API,
             data=payload,
@@ -202,24 +176,14 @@ class DKKDCrawler:
             headers=_JSON_HEADERS,
         )
         resp.raise_for_status()
-
-        raw_list = resp.json().get("d", [])
-        return [_parse_company(c) for c in raw_list]
+        return [_parse_company(c) for c in resp.json().get("d", [])]
 
     def find_exact_by_taxcode(self, taxcode: str) -> Optional[Company]:
         """Return the company whose tax code exactly matches *taxcode*, or None."""
         return next((c for c in self.search(taxcode) if c.tax_code == taxcode), None)
 
     def get_business_lines(self, company_id: str) -> list[BusinessLine]:
-        """
-        Fetch all business lines for a company by iterating LoadMore pages.
-
-        Args:
-            company_id: The company's internal Id from the search results
-
-        Returns:
-            List of BusinessLine objects
-        """
+        """Fetch all business lines for a company by iterating LoadMore pages."""
         lines: list[BusinessLine] = []
         page_index = 0
         load_more_headers = {
@@ -262,30 +226,21 @@ class DKKDCrawler:
 
     def get_detail_fields(self, taxcode: str) -> dict:
         """
-        Retrieve extra company fields (legal_form, establishment_date) from the detail page.
+        Retrieve extra fields (legal_form, establishment_date) from the detail page.
 
         Tries a plain HTTP request first; if reCAPTCHA is detected falls back to
-        Playwright (headless browser). Returns an empty dict when neither strategy
-        can retrieve the data.
-
-        Args:
-            taxcode: Tax code used to search and navigate to the company page
-
-        Returns:
-            Dict with keys 'legal_form' and/or 'establishment_date'
+        CloakBrowser (stealth Chromium). Returns an empty dict when neither works.
         """
         result = self._get_detail_fields_via_requests(taxcode)
         if result is not None:
             return result
-
-        return self._get_detail_fields_via_playwright(taxcode)
+        return self._get_detail_fields_via_cloakbrowser(taxcode)
 
     def _get_detail_fields_via_requests(self, taxcode: str) -> Optional[dict]:
         """
-        Try to fetch the detail page with the existing requests session.
+        Try the detail page with the existing requests session.
 
-        Returns None if the page is protected by reCAPTCHA (signals fallback needed).
-        Returns a dict (possibly empty) on success.
+        Returns None if reCAPTCHA is detected (signals CloakBrowser fallback needed).
         """
         try:
             resp = self._session.get(
@@ -301,89 +256,70 @@ class DKKDCrawler:
 
         html = resp.content.decode("utf-8", errors="replace")
         if any(marker in html.lower() for marker in _CAPTCHA_MARKERS):
-            return None  # reCAPTCHA present — caller will use Playwright
+            return None
 
         return _parse_detail_html(BeautifulSoup(html, "lxml"))
 
-    def _get_detail_fields_via_playwright(self, taxcode: str) -> dict:
+    def _get_detail_fields_via_cloakbrowser(self, taxcode: str) -> dict:
         """
-        Use a headless Chromium browser (Playwright) to navigate the site,
-        bypass reCAPTCHA, and extract legal_form / establishment_date.
+        Use CloakBrowser (stealth Chromium with built-in anti-fingerprinting)
+        to bypass reCAPTCHA and extract legal_form / establishment_date.
 
-        Requires:  pip install playwright && playwright install chromium
+        Requires:  pip install cloakbrowser
         """
         try:
-            from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+            from cloakbrowser import launch
         except ImportError:
             print(
-                "[crawler] playwright not installed — install with:\n"
-                "  pip install playwright && playwright install chromium\n"
+                "[crawler] cloakbrowser not installed — install with:\n"
+                "  pip install cloakbrowser\n"
                 "  Skipping legal_form and establishment_date.",
-                file=sys.stderr,
+                file=__import__("sys").stderr,
             )
             return {}
 
         result: dict = {}
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            ctx = browser.new_context(
-                user_agent=_USER_AGENT,
-                locale="vi-VN",
-                extra_http_headers={"Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8"},
-            )
-            page = ctx.new_page()
+        browser = launch(headless=True, humanize=True, locale="vi-VN")
+        page = browser.new_page()
 
-            try:
-                # Step 1 — load the search page to establish a valid session
-                page.goto(SEARCH_PAGE, wait_until="networkidle", timeout=30_000)
+        try:
+            page.goto(SEARCH_PAGE, wait_until="networkidle", timeout=30_000)
 
-                # Step 2 — fill in the search box and submit
-                search_input = page.locator(
-                    "input[name='ctl00$FldSearch'], input#ctl00_FldSearch, input[type='text']"
-                ).first
-                search_input.fill(taxcode)
+            search_input = page.locator(
+                "input[name='ctl00$FldSearch'], input#ctl00_FldSearch, input[type='text']"
+            ).first
+            search_input.fill(taxcode)
 
-                # Click the search button (common Vietnamese labels)
-                search_btn = page.locator(
-                    "input[type='submit'], button[type='submit'], "
-                    "input[value='Tìm kiếm'], button:has-text('Tìm kiếm'), "
-                    "a:has-text('Tìm kiếm')"
-                ).first
-                search_btn.click()
-                page.wait_for_load_state("networkidle", timeout=20_000)
+            search_btn = page.locator(
+                "input[type='submit'], button[type='submit'], "
+                "input[value='Tìm kiếm'], button:has-text('Tìm kiếm'), "
+                "a:has-text('Tìm kiếm')"
+            ).first
+            search_btn.click()
+            page.wait_for_load_state("networkidle", timeout=20_000)
 
-                # Step 3 — click the matching company link in results
-                company_link = page.locator(
-                    f"a:has-text('{taxcode}'), "
-                    "table.result-table td a, "
-                    ".search-result a, "
-                    "a[href*='EnterpriseInfo']"
-                ).first
-                company_link.click()
-                page.wait_for_load_state("networkidle", timeout=20_000)
+            company_link = page.locator(
+                f"a:has-text('{taxcode}'), "
+                "table.result-table td a, "
+                ".search-result a, "
+                "a[href*='EnterpriseInfo']"
+            ).first
+            company_link.click()
+            page.wait_for_load_state("networkidle", timeout=20_000)
 
-                html = page.content()
-                result = _parse_detail_html(BeautifulSoup(html, "lxml"))
+            result = _parse_detail_html(BeautifulSoup(page.content(), "lxml"))
 
-            except PWTimeout:
-                print("[crawler] Playwright timed out loading detail page.", file=sys.stderr)
-            except Exception as exc:  # noqa: BLE001
-                print(f"[crawler] Playwright error: {exc}", file=sys.stderr)
-            finally:
-                browser.close()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[crawler] CloakBrowser error: {exc}", file=__import__("sys").stderr)
+        finally:
+            browser.close()
 
         return result
 
-    def scrape_by_taxcode(self, taxcode: str) -> Optional["CompanyDetail"]:
+    def scrape_by_taxcode(self, taxcode: str) -> Optional[CompanyDetail]:
         """
         Full pipeline: search by exact tax code and return complete details
-        including legal form and establishment date from the detail page.
-
-        Args:
-            taxcode: Exact tax code (mã số thuế) to look up
-
-        Returns:
-            CompanyDetail with all available information, or None if not found
+        including business lines, legal form, and establishment date.
         """
         payload = json.dumps({"searchField": taxcode, "h": self._token()})
         resp = self._session.post(
@@ -400,10 +336,8 @@ class DKKDCrawler:
         if not raw:
             return None
 
-        company_id = raw.get("Id", "")
-        business_lines = self.get_business_lines(company_id)
+        business_lines = self.get_business_lines(raw.get("Id", ""))
         extra = self.get_detail_fields(taxcode)
-
         return _parse_company_detail(raw, business_lines, extra)
 
 
@@ -430,7 +364,7 @@ def _parse_company_detail(
     extra: Optional[dict] = None,
 ) -> CompanyDetail:
     extra = extra or {}
-    # The API response may already contain these fields; extra (from detail page) wins.
+    # extra (detail page) takes priority over API response fields
     legal_form = (
         extra.get("legal_form")
         or raw.get("Enterprise_Type_Name")
@@ -468,7 +402,6 @@ def _parse_detail_html(soup: BeautifulSoup) -> dict:
     """Extract legal_form and establishment_date from a detail page BeautifulSoup object."""
     result: dict = {}
 
-    # Strategy 1: scan table rows for label/value pairs
     for row in soup.find_all("tr"):
         cells = row.find_all(["td", "th"])
         if len(cells) < 2:
@@ -486,7 +419,7 @@ def _parse_detail_html(soup: BeautifulSoup) -> dict:
         if len(result) == 2:
             return result
 
-    # Strategy 2: scan ASP.NET control IDs
+    # Fallback: scan ASP.NET control IDs
     for tag in soup.find_all(attrs={"id": True}):
         tag_id = tag.get("id", "").lower().replace("_", "").replace("-", "")
         text = tag.get_text(strip=True)
@@ -510,74 +443,14 @@ def _parse_detail_html(soup: BeautifulSoup) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Module-level helpers
+# Public API
 # ---------------------------------------------------------------------------
 
 def search(query: str) -> list[Company]:
-    """Module-level helper: search by tax code or company name."""
+    """Search for companies by tax code or name."""
     return DKKDCrawler().search(query)
 
 
 def scrape_by_taxcode(taxcode: str) -> Optional[CompanyDetail]:
-    """Module-level helper: full detail scrape for an exact tax code match."""
+    """Full detail scrape for an exact tax code match."""
     return DKKDCrawler().scrape_by_taxcode(taxcode)
-
-
-def main() -> None:
-    args = sys.argv[1:]
-    if not args:
-        print("Sử dụng: python crawler.py [--detail] [--json] <mã_số_thuế_hoặc_tên_công_ty>")
-        print("Ví dụ:   python crawler.py 0105987432")
-        print("         python crawler.py --detail 0105987432")
-        print("         python crawler.py --detail --json 0105987432")
-        sys.exit(1)
-
-    detail_mode = "--detail" in args
-    json_mode = "--json" in args
-    query_args = [a for a in args if a not in ("--detail", "--json")]
-    if not query_args:
-        print("Lỗi: thiếu mã số thuế hoặc tên công ty", file=sys.stderr)
-        sys.exit(1)
-
-    query = query_args[0]
-
-    if detail_mode:
-        print(f"Đang cào toàn bộ thông tin cho mã số thuế: {query}", file=sys.stderr)
-        try:
-            detail = scrape_by_taxcode(query)
-        except Exception as exc:
-            print(f"Lỗi: {exc}", file=sys.stderr)
-            sys.exit(1)
-
-        if not detail:
-            print("Không tìm thấy công ty khớp chính xác với mã số thuế.", file=sys.stderr)
-            return
-
-        if json_mode:
-            print(json.dumps(detail.to_dict(), ensure_ascii=False, indent=2))
-        else:
-            print(detail)
-    else:
-        print(f"Đang tìm kiếm: {query}", file=sys.stderr)
-        try:
-            results = search(query)
-        except Exception as exc:
-            print(f"Lỗi: {exc}", file=sys.stderr)
-            sys.exit(1)
-
-        if not results:
-            print("Không tìm thấy kết quả.", file=sys.stderr)
-            return
-
-        if json_mode:
-            print(json.dumps([vars(r) for r in results], ensure_ascii=False, indent=2))
-        else:
-            print(f"Tìm thấy {len(results)} kết quả:\n")
-            for i, company in enumerate(results, 1):
-                print(f"[{i}]")
-                print(company)
-                print()
-
-
-if __name__ == "__main__":
-    main()
