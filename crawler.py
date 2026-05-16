@@ -1,24 +1,14 @@
 """
 Crawler for dichvuthongtin.dkkd.gov.vn
-Searches for Vietnamese company information by tax code or company name,
-and scrapes full details (business lines, legal form, establishment date)
-for an exact tax code match.
-
-The site uses an hdParameter session token on the search API and a
-LoadMore page method for paginated business lines. The detail page
-(which holds establishment date and legal form) is protected by reCAPTCHA
-and requires a headless browser via Playwright.
+Looks up full company details (business lines, legal form, establishment date)
+by exact tax code. The detail page is reCAPTCHA-protected and is accessed via
+CloakBrowser (stealth Chromium) when a plain HTTP request is blocked.
 
 Usage:
-    python crawler.py <taxcode_or_name>              # search only
-    python crawler.py --detail <taxcode>              # full detail (text)
-    python crawler.py --detail --json <taxcode>       # full detail (JSON)
+    python crawler.py <taxcode>
 
-Examples:
+Example:
     python crawler.py 0105987432
-    python crawler.py "SOFTDREAMS"
-    python crawler.py --detail 0105987432
-    python crawler.py --detail --json 0105987432
 """
 import sys
 import json
@@ -183,15 +173,7 @@ class DKKDCrawler:
         return self._h  # type: ignore[return-value]
 
     def search(self, query: str) -> list[Company]:
-        """
-        Search for companies by tax code (mã số thuế) or company name.
-
-        Args:
-            query: Tax code or company name fragment
-
-        Returns:
-            List of matching Company objects
-        """
+        """Search for companies by tax code (mã số thuế) or company name."""
         payload = json.dumps({"searchField": query, "h": self._token()})
 
         resp = self._session.post(
@@ -211,15 +193,7 @@ class DKKDCrawler:
         return next((c for c in self.search(taxcode) if c.tax_code == taxcode), None)
 
     def get_business_lines(self, company_id: str) -> list[BusinessLine]:
-        """
-        Fetch all business lines for a company by iterating LoadMore pages.
-
-        Args:
-            company_id: The company's internal Id from the search results
-
-        Returns:
-            List of BusinessLine objects
-        """
+        """Fetch all business lines for a company by iterating LoadMore pages."""
         lines: list[BusinessLine] = []
         page_index = 0
         load_more_headers = {
@@ -265,20 +239,14 @@ class DKKDCrawler:
         Retrieve extra company fields (legal_form, establishment_date) from the detail page.
 
         Tries a plain HTTP request first; if reCAPTCHA is detected falls back to
-        Playwright (headless browser). Returns an empty dict when neither strategy
+        CloakBrowser (stealth Chromium). Returns an empty dict when neither strategy
         can retrieve the data.
-
-        Args:
-            taxcode: Tax code used to search and navigate to the company page
-
-        Returns:
-            Dict with keys 'legal_form' and/or 'establishment_date'
         """
         result = self._get_detail_fields_via_requests(taxcode)
         if result is not None:
             return result
 
-        return self._get_detail_fields_via_playwright(taxcode)
+        return self._get_detail_fields_via_cloakbrowser(taxcode)
 
     def _get_detail_fields_via_requests(self, taxcode: str) -> Optional[dict]:
         """
@@ -301,76 +269,69 @@ class DKKDCrawler:
 
         html = resp.content.decode("utf-8", errors="replace")
         if any(marker in html.lower() for marker in _CAPTCHA_MARKERS):
-            return None  # reCAPTCHA present — caller will use Playwright
+            return None  # reCAPTCHA present — caller will use CloakBrowser
 
         return _parse_detail_html(BeautifulSoup(html, "lxml"))
 
-    def _get_detail_fields_via_playwright(self, taxcode: str) -> dict:
+    def _get_detail_fields_via_cloakbrowser(self, taxcode: str) -> dict:
         """
-        Use a headless Chromium browser (Playwright) to navigate the site,
-        bypass reCAPTCHA, and extract legal_form / establishment_date.
+        Use CloakBrowser (stealth Chromium) to navigate the site, bypass reCAPTCHA,
+        and extract legal_form / establishment_date.
 
-        Requires:  pip install playwright && playwright install chromium
+        Requires: pip install cloakbrowser
         """
         try:
-            from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+            from cloakbrowser import launch
         except ImportError:
             print(
-                "[crawler] playwright not installed — install with:\n"
-                "  pip install playwright && playwright install chromium\n"
+                "[crawler] cloakbrowser not installed — install with: pip install cloakbrowser\n"
                 "  Skipping legal_form and establishment_date.",
                 file=sys.stderr,
             )
             return {}
 
         result: dict = {}
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            ctx = browser.new_context(
-                user_agent=_USER_AGENT,
-                locale="vi-VN",
-                extra_http_headers={"Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8"},
-            )
-            page = ctx.new_page()
+        browser = launch(headless=True, locale="vi-VN")
+        ctx = browser.new_context(
+            extra_http_headers={"Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8"},
+        )
+        page = ctx.new_page()
 
-            try:
-                # Step 1 — load the search page to establish a valid session
-                page.goto(SEARCH_PAGE, wait_until="networkidle", timeout=30_000)
+        try:
+            # Step 1 — load the search page to establish a valid session
+            page.goto(SEARCH_PAGE, wait_until="networkidle", timeout=30_000)
 
-                # Step 2 — fill in the search box and submit
-                search_input = page.locator(
-                    "input[name='ctl00$FldSearch'], input#ctl00_FldSearch, input[type='text']"
-                ).first
-                search_input.fill(taxcode)
+            # Step 2 — fill in the search box and submit
+            search_input = page.locator(
+                "input[name='ctl00$FldSearch'], input#ctl00_FldSearch, input[type='text']"
+            ).first
+            search_input.fill(taxcode)
 
-                # Click the search button (common Vietnamese labels)
-                search_btn = page.locator(
-                    "input[type='submit'], button[type='submit'], "
-                    "input[value='Tìm kiếm'], button:has-text('Tìm kiếm'), "
-                    "a:has-text('Tìm kiếm')"
-                ).first
-                search_btn.click()
-                page.wait_for_load_state("networkidle", timeout=20_000)
+            search_btn = page.locator(
+                "input[type='submit'], button[type='submit'], "
+                "input[value='Tìm kiếm'], button:has-text('Tìm kiếm'), "
+                "a:has-text('Tìm kiếm')"
+            ).first
+            search_btn.click()
+            page.wait_for_load_state("networkidle", timeout=20_000)
 
-                # Step 3 — click the matching company link in results
-                company_link = page.locator(
-                    f"a:has-text('{taxcode}'), "
-                    "table.result-table td a, "
-                    ".search-result a, "
-                    "a[href*='EnterpriseInfo']"
-                ).first
-                company_link.click()
-                page.wait_for_load_state("networkidle", timeout=20_000)
+            # Step 3 — click the matching company link in results
+            company_link = page.locator(
+                f"a:has-text('{taxcode}'), "
+                "table.result-table td a, "
+                ".search-result a, "
+                "a[href*='EnterpriseInfo']"
+            ).first
+            company_link.click()
+            page.wait_for_load_state("networkidle", timeout=20_000)
 
-                html = page.content()
-                result = _parse_detail_html(BeautifulSoup(html, "lxml"))
+            html = page.content()
+            result = _parse_detail_html(BeautifulSoup(html, "lxml"))
 
-            except PWTimeout:
-                print("[crawler] Playwright timed out loading detail page.", file=sys.stderr)
-            except Exception as exc:  # noqa: BLE001
-                print(f"[crawler] Playwright error: {exc}", file=sys.stderr)
-            finally:
-                browser.close()
+        except Exception as exc:
+            print(f"[crawler] CloakBrowser error: {exc}", file=sys.stderr)
+        finally:
+            browser.close()
 
         return result
 
@@ -378,12 +339,6 @@ class DKKDCrawler:
         """
         Full pipeline: search by exact tax code and return complete details
         including legal form and establishment date from the detail page.
-
-        Args:
-            taxcode: Exact tax code (mã số thuế) to look up
-
-        Returns:
-            CompanyDetail with all available information, or None if not found
         """
         payload = json.dumps({"searchField": taxcode, "h": self._token()})
         resp = self._session.post(
@@ -524,59 +479,23 @@ def scrape_by_taxcode(taxcode: str) -> Optional[CompanyDetail]:
 
 
 def main() -> None:
-    args = sys.argv[1:]
-    if not args:
-        print("Sử dụng: python crawler.py [--detail] [--json] <mã_số_thuế_hoặc_tên_công_ty>")
-        print("Ví dụ:   python crawler.py 0105987432")
-        print("         python crawler.py --detail 0105987432")
-        print("         python crawler.py --detail --json 0105987432")
+    if len(sys.argv) != 2:
+        print("Sử dụng: python crawler.py <mã_số_thuế>", file=sys.stderr)
+        print("Ví dụ:   python crawler.py 0105987432", file=sys.stderr)
         sys.exit(1)
 
-    detail_mode = "--detail" in args
-    json_mode = "--json" in args
-    query_args = [a for a in args if a not in ("--detail", "--json")]
-    if not query_args:
-        print("Lỗi: thiếu mã số thuế hoặc tên công ty", file=sys.stderr)
+    taxcode = sys.argv[1]
+    try:
+        detail = scrape_by_taxcode(taxcode)
+    except Exception as exc:
+        print(f"Lỗi: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    query = query_args[0]
+    if not detail:
+        print(f"Không tìm thấy công ty với mã số thuế: {taxcode}", file=sys.stderr)
+        sys.exit(1)
 
-    if detail_mode:
-        print(f"Đang cào toàn bộ thông tin cho mã số thuế: {query}", file=sys.stderr)
-        try:
-            detail = scrape_by_taxcode(query)
-        except Exception as exc:
-            print(f"Lỗi: {exc}", file=sys.stderr)
-            sys.exit(1)
-
-        if not detail:
-            print("Không tìm thấy công ty khớp chính xác với mã số thuế.", file=sys.stderr)
-            return
-
-        if json_mode:
-            print(json.dumps(detail.to_dict(), ensure_ascii=False, indent=2))
-        else:
-            print(detail)
-    else:
-        print(f"Đang tìm kiếm: {query}", file=sys.stderr)
-        try:
-            results = search(query)
-        except Exception as exc:
-            print(f"Lỗi: {exc}", file=sys.stderr)
-            sys.exit(1)
-
-        if not results:
-            print("Không tìm thấy kết quả.", file=sys.stderr)
-            return
-
-        if json_mode:
-            print(json.dumps([vars(r) for r in results], ensure_ascii=False, indent=2))
-        else:
-            print(f"Tìm thấy {len(results)} kết quả:\n")
-            for i, company in enumerate(results, 1):
-                print(f"[{i}]")
-                print(company)
-                print()
+    print(json.dumps(detail.to_dict(), ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

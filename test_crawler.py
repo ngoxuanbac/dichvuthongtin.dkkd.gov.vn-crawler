@@ -500,17 +500,17 @@ class TestGetDetailFields:
         assert result.get("legal_form") == "Công ty cổ phần"
         assert result.get("establishment_date") == "09/09/2012"
 
-    def test_falls_back_to_playwright_when_captcha_detected(self):
+    def test_falls_back_to_cloakbrowser_when_captcha_detected(self):
         crawler = DKKDCrawler()
         crawler._h = "token"
         mock_session = MagicMock()
         mock_session.get.return_value = _make_response(FAKE_DETAIL_PAGE_WITH_CAPTCHA)
         crawler._session = mock_session
 
-        with patch.object(crawler, "_get_detail_fields_via_playwright", return_value={"legal_form": "JSC"}) as mock_pw:
+        with patch.object(crawler, "_get_detail_fields_via_cloakbrowser", return_value={"legal_form": "JSC"}) as mock_cb:
             result = crawler.get_detail_fields("0105987432")
 
-        mock_pw.assert_called_once_with("0105987432")
+        mock_cb.assert_called_once_with("0105987432")
         assert result == {"legal_form": "JSC"}
 
     def test_returns_empty_dict_on_request_failure(self):
@@ -521,10 +521,10 @@ class TestGetDetailFields:
         mock_session.get.side_effect = req.RequestException("connection error")
         crawler._session = mock_session
 
-        with patch.object(crawler, "_get_detail_fields_via_playwright", return_value={}) as mock_pw:
+        with patch.object(crawler, "_get_detail_fields_via_cloakbrowser", return_value={}) as mock_cb:
             result = crawler.get_detail_fields("0105987432")
 
-        mock_pw.assert_called_once()
+        mock_cb.assert_called_once()
         assert result == {}
 
 
