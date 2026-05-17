@@ -8,8 +8,6 @@ dependencies = [
     "beautifulsoup4>=4.11.0",
     "lxml>=4.9.0",
     "cloakbrowser>=0.1.0",
-    "speechrecognition>=3.16.1",
-    "pydub>=0.25.1",
 ]
 
 [project.scripts]

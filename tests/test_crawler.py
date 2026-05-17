@@ -60,10 +60,22 @@ FAKE_DETAIL_PAGE_HTML = """
 <html><body>
 <table>
   <tr><td>Tên doanh nghiệp:</td><td>CÔNG TY CỔ PHẦN TEST</td></tr>
+  <tr><td>Tên tiếng nước ngoài:</td><td>TEST JOINT STOCK COMPANY</td></tr>
+  <tr><td>Tên viết tắt:</td><td>TEST JSC</td></tr>
+  <tr><td>Mã số doanh nghiệp:</td><td>0001234567</td></tr>
+  <tr><td>Mã số thuế:</td><td>0105987432</td></tr>
+  <tr><td>Người đại diện theo pháp luật:</td><td>NGUYỄN VĂN A</td></tr>
   <tr><td>Loại hình doanh nghiệp:</td><td>Công ty cổ phần</td></tr>
   <tr><td>Ngày thành lập:</td><td>09/09/2012</td></tr>
-  <tr><td>Địa chỉ:</td><td>Số 1 Đường ABC, Hà Nội</td></tr>
+  <tr><td>Địa chỉ trụ sở chính:</td><td>Số 1 Đường ABC, Hà Nội</td></tr>
+  <tr><td>Địa chỉ nước ngoài:</td><td>No 1 ABC Street, Hanoi</td></tr>
+  <tr><td>5829 (Chính)</td><td>Xuất bản phần mềm khác</td></tr>
+  <tr><td>6201</td><td>Lập trình máy tính</td></tr>
+  <tr><td>6290</td><td>Dịch vụ công nghệ thông tin khác</td></tr>
 </table>
+<input type="hidden" name="City_Id" value="01" />
+<input type="hidden" name="District_Id" value="001" />
+<input type="hidden" name="Ward_Id" value="00001" />
 </body></html>
 """
 
@@ -253,7 +265,7 @@ class TestParseDetailHtml:
 
 
 class TestCompanyDetailToDict:
-    def test_to_dict_maps_vietnamese_keys(self):
+    def test_to_dict_maps_english_lower_camel_keys(self):
         detail = CompanyDetail(
             id="1",
             name="SOFTDREAMS",
@@ -268,22 +280,23 @@ class TestCompanyDetailToDict:
             address="Số 7 Chính Kinh, Hà Nội",
         )
         d = detail.to_dict()
-        assert d["ten_doanh_nghiep"] == "SOFTDREAMS"
-        assert d["ten_tieng_nuoc_ngoai"] == "SOFTDREAMS JSC"
-        assert d["ten_viet_tat"] == "SD"
-        assert d["tinh_trang_hoat_dong"] == "Đang hoạt động"
-        assert d["ma_so_doanh_nghiep"] == "0105987432"
-        assert d["loai_hinh_phap_ly"] == "Công ty cổ phần"
-        assert d["ngay_bat_dau_thanh_lap"] == "09/09/2012"
-        assert d["nguoi_dai_dien_phap_luat"] == "VŨ VĂN LUẬT"
-        assert d["dia_chi_tru_so_chinh"] == "Số 7 Chính Kinh, Hà Nội"
+        assert d["companyName"] == "SOFTDREAMS"
+        assert d["foreignName"] == "SOFTDREAMS JSC"
+        assert d["shortName"] == "SD"
+        assert d["status"] == "Đang hoạt động"
+        assert d["taxCode"] == "0105987432"
+        assert d["enterpriseCode"] == "0105987432"
+        assert d["legalForm"] == "Công ty cổ phần"
+        assert d["establishmentDate"] == "09/09/2012"
+        assert d["legalRepresentative"] == "VŨ VĂN LUẬT"
+        assert d["headOfficeAddress"] == "Số 7 Chính Kinh, Hà Nội"
 
     def test_to_dict_empty_optionals_produce_empty_strings(self):
         detail = CompanyDetail(id="1", name="X", enterprise_code="X", tax_code="X")
         d = detail.to_dict()
-        assert d["loai_hinh_phap_ly"] == ""
-        assert d["ngay_bat_dau_thanh_lap"] == ""
-        assert d["nguoi_dai_dien_phap_luat"] == ""
+        assert d["legalForm"] == ""
+        assert d["establishmentDate"] == ""
+        assert d["legalRepresentative"] == ""
 
 
 class TestBusinessLine:
@@ -534,14 +547,15 @@ class TestScrapeByTaxcode:
         crawler._h = "token"
         mock_session = MagicMock()
 
-        load_more_responses = [_make_response({"d": p}) for p in load_more_pages]
+        load_more_responses = [_make_response({"d": page}) for page in load_more_pages]
         load_more_responses.append(_make_response({"d": ""}))
 
         mock_session.post.side_effect = [
             _make_response(search_response),
+            _make_response(detail_html),
             *load_more_responses,
         ]
-        mock_session.get.return_value = _make_response(detail_html)
+        mock_session.get.return_value = _make_response(FAKE_MAIN_PAGE)
         crawler._session = mock_session
         return crawler
 

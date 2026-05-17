@@ -59,16 +59,30 @@ class CompanyDetail:
     business_lines: list[BusinessLine] = field(default_factory=list)
 
     def to_dict(self) -> dict:
+        business_lines = [
+            {
+                "code": bl.code,
+                "description": bl.description,
+                "isMain": bl.is_main,
+            }
+            for bl in self.business_lines
+        ]
         return {
-            "company_name": self.name,
-            "foreign_name": self.name_foreign or "",
-            "short_name": self.short_name or "",
+            "companyName": self.name,
+            "foreignName": self.name_foreign or "",
+            "shortName": self.short_name or "",
             "status": self.status or "",
-            "tax_code": self.tax_code,
-            "legal_form": self.legal_form or "",
-            "establishment_date": self.establishment_date or "",
-            "legal_representative": self.legal_representative or "",
-            "address": self.address or "",
+            "taxCode": self.tax_code,
+            "enterpriseCode": self.enterprise_code,
+            "legalForm": self.legal_form or "",
+            "establishmentDate": self.establishment_date or "",
+            "legalRepresentative": self.legal_representative or "",
+            "headOfficeAddress": self.address or "",
+            "foreignAddress": self.address_foreign or "",
+            "cityId": self.city_id or "",
+            "districtId": self.district_id or "",
+            "wardId": self.ward_id or "",
+            "businessLines": business_lines,
         }
 
     def __str__(self) -> str:
