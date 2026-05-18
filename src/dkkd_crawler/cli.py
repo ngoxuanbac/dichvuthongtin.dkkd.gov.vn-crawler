@@ -59,9 +59,8 @@ def _scrape_with_spinner(taxcode: str, debug: bool):
     finally:
         done.set()
         spinner.join(timeout=1.0)
-        # Clear spinner line before printing final output/errors
-        clear_width = len(message) + 4
-        print(f"\r{' ' * clear_width}\r", end="", file=sys.stderr, flush=True)
+        # Clear entire spinner line before printing final output/errors
+        print("\r\033[2K", end="", file=sys.stderr, flush=True)
 
 
 def main() -> None:
