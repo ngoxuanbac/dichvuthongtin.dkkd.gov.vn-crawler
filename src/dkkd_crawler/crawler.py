@@ -59,6 +59,9 @@ class DKKDCrawler:
         self._h: Optional[str] = None
         self._debug = debug
         self._status_callback = status_callback
+        # Cached from _get_detail_fields_via_requests so _get_captcha_page_url
+        # doesn't have to repeat the same GET+POST navigation a second time.
+        self._last_captcha_url: Optional[str] = None
 
     def _log(self, message: str) -> None:
         if self._debug:
@@ -208,8 +211,10 @@ class DKKDCrawler:
         # If the site redirected back to the home page, the navigation failed
         if "<title>" in html and "Trang chủ" in html[:2000]:
             return None
-        # Captcha required — hand off to browser
+        # Captcha required — hand off to browser (cache the URL, see _last_captcha_url).
         if any(marker in html.lower() for marker in _CAPTCHA_MARKERS):
+            if "EnterpriseInfo.aspx" in resp.url:
+                self._last_captcha_url = resp.url
             return None
 
         return _parse_detail_html(BeautifulSoup(html, "lxml"))
@@ -229,13 +234,11 @@ class DKKDCrawler:
             )
             return {}
 
-        # Step 1 — use the requests session to navigate to the captcha page and get its URL
         captcha_url = self._get_captcha_page_url(taxcode, company_id)
         if not captcha_url:
             self._log("[crawler] could not reach captcha page via requests")
             return {}
 
-        # Step 2 — extract session cookies to share with the browser
         session_cookies = [
             {
                 "name": c.name,
@@ -284,6 +287,9 @@ class DKKDCrawler:
         """POST the search form via requests and return the captcha page URL."""
         if not company_id:
             return None
+        if self._last_captcha_url:
+            cached, self._last_captcha_url = self._last_captcha_url, None
+            return cached
         try:
             resp0 = self._session.get(SEARCH_PAGE, verify=False, timeout=30)
             resp0.raise_for_status()
@@ -377,7 +383,6 @@ def _solve_captcha_and_submit(page, debug: bool = False) -> None:
     many times in rapid succession.  When blocked, re-run after a few hours or
     use a different IP / VPN.
     """
-    # Step 1 — click the checkbox
     try:
         page.wait_for_selector("iframe[src*='recaptcha'][src*='anchor']", timeout=10_000)
         checkbox_frame = page.frame_locator("iframe[title='reCAPTCHA']")
@@ -385,9 +390,10 @@ def _solve_captcha_and_submit(page, debug: bool = False) -> None:
     except Exception:
         pass
 
-    # Step 2 — wait for auto-solve (up to 6 s)
-    for _ in range(6):
-        page.wait_for_timeout(1_000)
+    # Poll every 300ms (up to 6s total) instead of a flat 1s so auto-solve is
+    # caught as soon as it resolves rather than always burning a full second.
+    for _ in range(20):
+        page.wait_for_timeout(300)
         gr_len = page.evaluate(
             "document.querySelector('[name=g-recaptcha-response]')"
             "? document.querySelector('[name=g-recaptcha-response]').value.length : 0"
@@ -397,7 +403,6 @@ def _solve_captcha_and_submit(page, debug: bool = False) -> None:
                 print("[captcha] auto-solved", file=sys.stderr)
             break
     else:
-        # Step 3 — auto-solve didn't happen, try the audio challenge
         try:
             challenge_frame = page.frame_locator("iframe[src*='bframe']")
             audio_btn = challenge_frame.locator("#recaptcha-audio-button")
@@ -410,7 +415,7 @@ def _solve_captcha_and_submit(page, debug: bool = False) -> None:
             if debug:
                 print(f"[captcha] challenge handling failed: {exc}", file=sys.stderr)
 
-    # Step 4 — submit the site's form via JS (bypasses overlay elements)
+    # Submit via JS — bypasses overlay elements that block a direct click.
     try:
         page.evaluate("document.getElementById('ctl00_C_btnSubmit').click()")
     except Exception as exc:
@@ -536,7 +541,8 @@ def _solve_audio_challenge(page, challenge_frame, debug: bool = False) -> None:
 
     try:
         challenge_frame.locator("#recaptcha-audio-button").click()
-        page.wait_for_timeout(2_000)
+        # No fixed sleep here — the #audio-source lookup below already waits
+        # (timeout=6_000) for the audio frame to swap in.
     except Exception as exc:
         if debug:
             print(f"[captcha] audio button click failed: {exc}", file=sys.stderr)
@@ -554,7 +560,6 @@ def _solve_audio_challenge(page, challenge_frame, debug: bool = False) -> None:
         except Exception:
             pass
 
-        # Get audio URL from the <source> element (correct selector)
         try:
             audio_url = challenge_frame.locator("#audio-source").get_attribute("src", timeout=6_000)
         except Exception:
@@ -563,14 +568,15 @@ def _solve_audio_challenge(page, challenge_frame, debug: bool = False) -> None:
         if not audio_url:
             if debug:
                 print(f"[captcha] attempt {attempt}: audio source not found yet", file=sys.stderr)
-            page.wait_for_timeout(2_000)
+            page.wait_for_timeout(800)
             continue
 
         # Reload if same URL repeated (means previous answer was wrong)
         if audio_url == seen_url:
             try:
                 challenge_frame.locator("#recaptcha-reload-button").click()
-                page.wait_for_timeout(2_000)
+                # Real network round-trip to fetch a new challenge — keep this one.
+                page.wait_for_timeout(1_500)
             except Exception:
                 pass
             continue
@@ -579,7 +585,6 @@ def _solve_audio_challenge(page, challenge_frame, debug: bool = False) -> None:
         if debug:
             print(f"[captcha] attempt {attempt}: transcribing...", file=sys.stderr)
 
-        # Use English-only transcription mode.
         transcription = _transcribe_via_server(audio_url, "en-US", debug)
 
         if not transcription:
@@ -587,7 +592,8 @@ def _solve_audio_challenge(page, challenge_frame, debug: bool = False) -> None:
                 print(f"[captcha] attempt {attempt}: transcription failed, reloading", file=sys.stderr)
             try:
                 challenge_frame.locator("#recaptcha-reload-button").click()
-                page.wait_for_timeout(2_000)
+                # Real network round-trip to fetch a new challenge — keep this one.
+                page.wait_for_timeout(1_500)
             except Exception:
                 pass
             continue
@@ -595,11 +601,12 @@ def _solve_audio_challenge(page, challenge_frame, debug: bool = False) -> None:
         if debug:
             print(f"[captcha] attempt {attempt}: got {transcription!r}", file=sys.stderr)
         challenge_frame.locator("#audio-response").fill(transcription)
+        # Keep this pause: filling the field and submitting instantly is a
+        # classic bot fingerprint reCAPTCHA's risk scoring looks for.
         page.wait_for_timeout(500)
         challenge_frame.locator("#recaptcha-verify-button").click()
-        page.wait_for_timeout(2_500)
+        page.wait_for_timeout(2_000)
 
-        # Check if captcha is now solved
         gr_len = page.evaluate(
             "document.querySelector('[name=g-recaptcha-response]')"
             "? document.querySelector('[name=g-recaptcha-response]').value.length : 0"
@@ -677,7 +684,6 @@ def _parse_span_detail_fields(soup: BeautifulSoup, result: dict[str, Any]) -> No
         if not text:
             continue
 
-        # Match based on exact ID patterns
         if span_id.endswith("namefld") and not result.get("name"):
             if "name_f" not in span_id:  # Exclude name_foreign field
                 result["name"] = text

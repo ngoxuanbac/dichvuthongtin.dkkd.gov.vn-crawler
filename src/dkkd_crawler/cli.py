@@ -2,6 +2,7 @@ import argparse
 import json
 import sys
 import threading
+import time
 
 from .crawler import scrape_by_taxcode
 
@@ -77,6 +78,7 @@ def main() -> None:
     args = parser.parse_args()
 
     taxcode = args.taxcode
+    start_time = time.perf_counter()
     try:
         detail = _scrape_with_spinner(taxcode, debug=args.debug)
     except KeyboardInterrupt:
@@ -85,6 +87,9 @@ def main() -> None:
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(1)
+    finally:
+        elapsed = time.perf_counter() - start_time
+        print(f"[time] processed in {elapsed:.2f}s", file=sys.stderr)
 
     if not detail:
         print(f"not found company with tax code: {taxcode}", file=sys.stderr)
